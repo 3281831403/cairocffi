@@ -2,6 +2,19 @@ cairocffi changelog
 -------------------
 
 
+Version 1.8.0
+.............
+
+* Add the :class:`MeshPattern` class with full support for cairo mesh
+  patterns: building patches (``begin_patch``/``end_patch``,
+  ``move_to``/``line_to``/``curve_to``, control points and corner
+  colors), reading back patch counts, corner colors, control points and
+  patch paths (in the same format as ``Context.copy_path`` and usable
+  with ``Context.append_path``). A mesh pattern taken back from a
+  context with ``Context.get_source`` now keeps its ``MeshPattern``
+  type. Requires cairo >= 1.12.
+
+
 Version 1.7.1
 .............
 

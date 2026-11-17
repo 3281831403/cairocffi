@@ -31,9 +31,9 @@ from . import (  # isort:skip
     PDF_METADATA_TITLE, PDF_OUTLINE_FLAG_BOLD, PDF_OUTLINE_FLAG_OPEN,
     PDF_OUTLINE_ROOT, SVG_UNIT_PC, SVG_UNIT_PT, SVG_UNIT_PX, SVG_UNIT_USER,
     TAG_LINK, Context, FontFace, FontOptions, ImageSurface, LinearGradient,
-    Matrix, Pattern, PDFSurface, PSSurface, RadialGradient, RecordingSurface,
-    ScaledFont, SolidPattern, Surface, SurfacePattern, SVGSurface, ToyFontFace,
-    cairo_version, cairo_version_string)
+    Matrix, MeshPattern, Pattern, PDFSurface, PSSurface, RadialGradient,
+    RecordingSurface, ScaledFont, SolidPattern, Surface, SurfacePattern,
+    SVGSurface, ToyFontFace, cairo_version, cairo_version_string)
 
 if sys.byteorder == 'little':
     def pixel(argb):  # pragma: no cover
@@ -706,6 +706,385 @@ def test_radial_gradient():
 
     assert b'/ShadingType 3' not in pdf_with_pattern()
     assert b'/ShadingType 3' in pdf_with_pattern(gradient)
+
+
+def _add_quad_patch(pattern, colors, with_curve=False):
+    """Add a 100x100 four-sided patch with a color at every corner."""
+    pattern.begin_patch()
+    pattern.move_to(0, 0)
+    if with_curve:
+        # A cubic Bézier that is geometrically the straight top edge.
+        pattern.curve_to(33.3, 0, 66.6, 0, 100, 0)
+    else:
+        pattern.line_to(100, 0)
+    pattern.line_to(100, 100)
+    pattern.line_to(0, 100)
+    pattern.line_to(0, 0)
+    for corner, color in enumerate(colors):
+        pattern.set_corner_color_rgba(corner, *color)
+    pattern.set_control_point(0, 25, 25)
+    pattern.end_patch()
+
+
+def _add_triangle_patch(pattern):
+    """Add a three-sided patch (three edges after move_to)."""
+    pattern.begin_patch()
+    pattern.move_to(0, 0)
+    pattern.line_to(100, 0)
+    pattern.line_to(100, 100)
+    pattern.line_to(0, 100)
+    pattern.set_corner_color_rgb(0, 1, 0, 0)
+    pattern.set_corner_color_rgb(1, 0, 1, 0)
+    pattern.set_corner_color_rgb(2, 0, 0, 1)
+    pattern.end_patch()
+
+
+def _paint_pattern(pattern, width=100, height=100):
+    surface = ImageSurface(cairocffi.FORMAT_ARGB32, width, height)
+    context = Context(surface)
+    context.set_source(pattern)
+    context.paint()
+    return surface.get_data()[:]
+
+
+@pytest.mark.xfail(cairo_version() < 11200,
+                   reason='Mesh patterns require cairo >= 1.12')
+def test_mesh_pattern_construction():
+    pattern = MeshPattern()
+    assert pattern.get_patch_count() == 0
+    _add_quad_patch(
+        pattern,
+        [(1, 0, 0, 1), (0, 1, 0, 1), (0, 0, 1, 1), (1, 1, 0, 1)])
+    assert pattern.get_patch_count() == 1
+
+    # Corner colors can be read back, both rgb and rgba variants.
+    assert pattern.get_corner_color_rgba(0, 0) == (1, 0, 0, 1)
+    assert pattern.get_corner_color_rgba(0, 1) == (0, 1, 0, 1)
+    assert pattern.get_corner_color_rgba(0, 2) == (0, 0, 1, 1)
+    assert pattern.get_corner_color_rgba(0, 3) == (1, 1, 0, 1)
+
+    # The explicitly set control point is read back verbatim.
+    assert pattern.get_control_point(0, 0) == (25, 25)
+    # Unset control points are computed by cairo and still readable.
+    for point_num in (1, 2, 3):
+        x, y = pattern.get_control_point(0, point_num)
+        assert isinstance(x, float) and isinstance(y, float)
+
+    # Corners left without a color default to transparent black.
+    sparse = MeshPattern()
+    sparse.begin_patch()
+    sparse.move_to(0, 0)
+    sparse.line_to(10, 0)
+    sparse.line_to(10, 10)
+    sparse.line_to(0, 10)
+    sparse.set_corner_color_rgb(0, 1, 0, 0)
+    sparse.end_patch()
+    assert sparse.get_corner_color_rgba(0, 0) == (1, 0, 0, 1)
+    assert sparse.get_corner_color_rgba(0, 1) == (0, 0, 0, 0)
+    assert sparse.get_corner_color_rgba(0, 2) == (0, 0, 0, 0)
+    assert sparse.get_corner_color_rgba(0, 3) == (0, 0, 0, 0)
+
+
+@pytest.mark.xfail(cairo_version() < 11200,
+                   reason='Mesh patterns require cairo >= 1.12')
+def test_mesh_pattern_multiple_patches():
+    pattern = MeshPattern()
+    _add_quad_patch(pattern, [(1, 0, 0, 1)] * 4)
+    _add_triangle_patch(pattern)
+    assert pattern.get_patch_count() == 2
+    # Each patch keeps its own corner colors.
+    assert pattern.get_corner_color_rgba(0, 0) == (1, 0, 0, 1)
+    assert pattern.get_corner_color_rgba(1, 0) == (1, 0, 0, 1)
+    assert pattern.get_corner_color_rgba(1, 1) == (0, 1, 0, 1)
+    assert pattern.get_corner_color_rgba(1, 2) == (0, 0, 1, 1)
+
+
+@pytest.mark.xfail(cairo_version() < 11200,
+                   reason='Mesh patterns require cairo >= 1.12')
+def test_mesh_pattern_get_path():
+    pattern = MeshPattern()
+    _add_quad_patch(
+        pattern,
+        [(1, 0, 0, 1), (0, 1, 0, 1), (0, 0, 1, 1), (1, 1, 0, 1)])
+    mesh_path = pattern.get_path(0)
+
+    # Same format as Context.copy_path(): (operation, coordinates) tuples.
+    assert mesh_path[0][0] == cairocffi.PATH_MOVE_TO
+    # cairo stores every mesh side (including line_to) as a curve.
+    assert all(operation == cairocffi.PATH_CURVE_TO
+               for operation, _ in mesh_path[1:])
+    assert all(len(coordinates) == 6 for _, coordinates in mesh_path[1:])
+
+    # The path can be fed straight to Context.append_path(), after which
+    # copy_path() returns the same operations (cairo re-encodes the
+    # control point coordinates slightly, so compare the structure and
+    # round the floats).
+    surface = ImageSurface(cairocffi.FORMAT_ARGB32, 100, 100)
+    context = Context(surface)
+    context.append_path(mesh_path)
+    copied = context.copy_path()
+    assert [operation for operation, _ in copied] == [
+        operation for operation, _ in mesh_path]
+    assert (
+        [len(coordinates) for _, coordinates in copied]
+        == [len(coordinates) for _, coordinates in mesh_path])
+    for (_, copied_coords), (_, mesh_coords) in zip(copied, mesh_path):
+        for copied_value, mesh_value in zip(copied_coords, mesh_coords):
+            assert abs(copied_value - mesh_value) < 0.01
+
+    # A path built with curve_to is exposed as curves too.
+    curved = MeshPattern()
+    _add_quad_patch(curved, [(0, 0, 0, 1)] * 4, with_curve=True)
+    assert all(operation == cairocffi.PATH_CURVE_TO
+               for operation, _ in curved.get_path(0)[1:])
+
+
+@pytest.mark.xfail(cairo_version() < 11200,
+                   reason='Mesh patterns require cairo >= 1.12')
+def test_mesh_pattern_get_source():
+    pattern = MeshPattern()
+    _add_quad_patch(
+        pattern,
+        [(1, 0, 0, 1), (0, 1, 0, 1), (0, 0, 1, 1), (1, 1, 0, 1)])
+    surface = ImageSurface(cairocffi.FORMAT_ARGB32, 100, 100)
+    context = Context(surface)
+    context.set_source(pattern)
+
+    # The pattern taken back from the context keeps its mesh type and
+    # all of its data instead of being reduced to the base Pattern.
+    source = context.get_source()
+    assert isinstance(source, MeshPattern)
+    assert isinstance(source, Pattern)
+    assert source.get_patch_count() == 1
+    assert source.get_corner_color_rgba(0, 0) == (1, 0, 0, 1)
+    assert source.get_control_point(0, 0) == (25, 25)
+    assert source.get_path(0) == pattern.get_path(0)
+
+    # The generic mapping knows about the mesh pattern type.
+    assert (cairocffi.patterns.PATTERN_TYPE_TO_CLASS[
+        cairocffi.PATTERN_TYPE_MESH] is MeshPattern)
+
+
+@pytest.mark.xfail(cairo_version() < 11200,
+                   reason='Mesh patterns require cairo >= 1.12')
+def test_mesh_pattern_construction_errors():
+    def expect_status(func, status):
+        with pytest.raises(cairocffi.CairoError) as exc_info:
+            func()
+        assert exc_info.value.status == status
+        # The exception carries the cairo status both as an attribute
+        # and inside its message.
+        assert cairocffi.ffi.string(
+            cairocffi.ffi.cast('cairo_status_t', status)) in str(
+            exc_info.value)
+
+    invalid_construction = cairocffi.STATUS_INVALID_MESH_CONSTRUCTION
+    invalid_index = cairocffi.STATUS_INVALID_INDEX
+
+    # end_patch() without a matching begin_patch().
+    pattern = MeshPattern()
+    expect_status(pattern.end_patch, invalid_construction)
+
+    # Path operations outside of a patch. Each one gets a fresh
+    # pattern: once cairo puts a mesh pattern in an error state it
+    # stays there.
+    def finished_pattern():
+        pattern = MeshPattern()
+        pattern.begin_patch()
+        pattern.move_to(0, 0)
+        pattern.line_to(10, 0)
+        pattern.line_to(10, 10)
+        pattern.line_to(0, 10)
+        pattern.end_patch()
+        return pattern
+
+    expect_status(lambda: finished_pattern().move_to(0, 0),
+                  invalid_construction)
+    expect_status(lambda: finished_pattern().line_to(1, 1),
+                  invalid_construction)
+    expect_status(
+        lambda: finished_pattern().curve_to(0, 0, 1, 1, 2, 2),
+        invalid_construction)
+
+    # cairo rejects a fifth side while the patch is being built: a
+    # patch may have at most four sides, so the extra line_to raises
+    # rather than end_patch().
+    def five_sided_patch():
+        broken = MeshPattern()
+        broken.begin_patch()
+        broken.move_to(0, 0)
+        for index in range(5):
+            broken.line_to(index + 1, index + 1)
+        broken.end_patch()
+    expect_status(five_sided_patch, invalid_construction)
+
+    # Corner and control point numbers are limited to 0..3.
+    pattern = MeshPattern()
+    pattern.begin_patch()
+    pattern.move_to(0, 0)
+    pattern.line_to(10, 0)
+    pattern.line_to(10, 10)
+    pattern.line_to(0, 10)
+    expect_status(
+        lambda: pattern.set_corner_color_rgb(4, 1, 1, 1), invalid_index)
+    expect_status(
+        lambda: pattern.set_corner_color_rgba(4, 1, 1, 1, 1), invalid_index)
+    expect_status(
+        lambda: pattern.set_control_point(4, 1, 1), invalid_index)
+
+
+@pytest.mark.xfail(cairo_version() < 11200,
+                   reason='Mesh patterns require cairo >= 1.12')
+def test_mesh_pattern_getter_index_errors():
+    pattern = MeshPattern()
+    _add_quad_patch(
+        pattern,
+        [(1, 0, 0, 1), (0, 1, 0, 1), (0, 0, 1, 1), (1, 1, 0, 1)])
+    invalid_index = cairocffi.STATUS_INVALID_INDEX
+    with pytest.raises(cairocffi.CairoError) as exc_info:
+        pattern.get_corner_color_rgba(99, 0)
+    assert exc_info.value.status == invalid_index
+    with pytest.raises(cairocffi.CairoError) as exc_info:
+        pattern.get_corner_color_rgba(0, 99)
+    assert exc_info.value.status == invalid_index
+    with pytest.raises(cairocffi.CairoError) as exc_info:
+        pattern.get_control_point(99, 0)
+    assert exc_info.value.status == invalid_index
+    with pytest.raises(cairocffi.CairoError) as exc_info:
+        pattern.get_path(99)
+    assert exc_info.value.status == invalid_index
+
+
+@pytest.mark.xfail(cairo_version() < 11200,
+                   reason='Mesh patterns require cairo >= 1.12')
+def test_mesh_pattern_pixels():
+    # Triangle and quadrilateral patches both render, and differently.
+    triangle = MeshPattern()
+    _add_triangle_patch(triangle)
+    assert triangle.get_patch_count() == 1
+    triangle_pixels = _paint_pattern(triangle)
+
+    quadrilateral = MeshPattern()
+    _add_quad_patch(
+        quadrilateral,
+        [(1, 0, 0, 1), (0, 1, 0, 1), (0, 0, 1, 1), (1, 1, 0, 1)])
+    quad_pixels = _paint_pattern(quadrilateral)
+
+    assert triangle_pixels != b'\x00' * len(triangle_pixels)
+    assert quad_pixels != b'\x00' * len(quad_pixels)
+    assert triangle_pixels != quad_pixels
+
+    # A plain square patch (no warping control point) interpolates the
+    # corner colors, so the area near each corner is dominated by that
+    # corner's color.
+    plain = MeshPattern()
+    plain.begin_patch()
+    plain.move_to(0, 0)
+    plain.line_to(100, 0)
+    plain.line_to(100, 100)
+    plain.line_to(0, 100)
+    plain.line_to(0, 0)
+    corner_colors = [
+        (1, 0, 0, 1), (0, 1, 0, 1), (0, 0, 1, 1), (1, 1, 0, 1)]
+    for corner, color in enumerate(corner_colors):
+        plain.set_corner_color_rgba(corner, *color)
+    plain.end_patch()
+
+    surface = ImageSurface(cairocffi.FORMAT_ARGB32, 100, 100)
+    context = Context(surface)
+    context.set_source(plain)
+    context.paint()
+    stride = surface.get_stride()
+    data = bytes(surface.get_data())
+    # Sample pixels close to each corner, where that corner's color
+    # dominates the bilinear interpolation.
+    samples = {
+        0: (3, 3),      # red corner (top-left)
+        1: (96, 3),     # green corner (top-right)
+        2: (96, 96),    # blue corner (bottom-right)
+        3: (3, 96),     # yellow corner (bottom-left)
+    }
+    for corner, (x, y) in samples.items():
+        offset = y * stride + x * 4
+        if sys.byteorder == 'little':  # BGRA in memory on little-endian
+            blue, green, red, alpha = data[offset:offset + 4]
+        else:  # pragma: no cover
+            alpha, red, green, blue = data[offset:offset + 4]
+        assert alpha == 255
+        channels = {'red': red, 'green': green, 'blue': blue}
+        expected_red, expected_green, expected_blue, _ = corner_colors[corner]
+        expected_channels = {
+            name for name, value in zip(
+                ('red', 'green', 'blue'),
+                (expected_red, expected_green, expected_blue)) if value}
+        # Every channel that is "on" at this corner is rendered bright,
+        # and every channel that is "off" stays dark.
+        for name, value in channels.items():
+            if name in expected_channels:
+                assert value > 200, (corner, name, value)
+            else:
+                assert value < 60, (corner, name, value)
+
+
+@pytest.mark.xfail(cairo_version() < 11200,
+                   reason='Mesh patterns require cairo >= 1.12')
+def test_mesh_pattern_recording_replay():
+    pattern = MeshPattern()
+    _add_quad_patch(
+        pattern,
+        [(1, 0, 0, 1), (0, 1, 0, 1), (0, 0, 1, 1), (1, 1, 0, 1)])
+
+    direct = ImageSurface(cairocffi.FORMAT_ARGB32, 100, 100)
+    context = Context(direct)
+    context.set_source(pattern)
+    context.paint()
+    direct_pixels = direct.get_data()[:]
+
+    # Replaying a recording of the same paint gives identical pixels.
+    recording = RecordingSurface(
+        cairocffi.CONTENT_COLOR_ALPHA, (0, 0, 100, 100))
+    context = Context(recording)
+    context.set_source(pattern)
+    context.paint()
+
+    replayed = ImageSurface(cairocffi.FORMAT_ARGB32, 100, 100)
+    context = Context(replayed)
+    context.set_source_surface(recording)
+    context.paint()
+    assert replayed.get_data()[:] == direct_pixels
+
+
+@pytest.mark.xfail(cairo_version() < 11200,
+                   reason='Mesh patterns require cairo >= 1.12')
+def test_mesh_pattern_pdf_svg_output():
+    pattern = MeshPattern()
+    _add_quad_patch(
+        pattern,
+        [(1, 0, 0, 1), (0, 1, 0, 1), (0, 0, 1, 1), (1, 1, 0, 1)])
+
+    # PDF keeps the mesh as a native (Coons patch) shading dictionary.
+    pdf_file = io.BytesIO()
+    pdf_surface = PDFSurface(pdf_file, 100, 100)
+    context = Context(pdf_surface)
+    context.set_source(pattern)
+    context.paint()
+    pdf_surface.finish()
+    pdf_bytes = pdf_file.getvalue()
+    assert pdf_bytes.startswith(b'%PDF')
+    # A mesh patch is emitted as a tensor-product patch shading (type 7).
+    assert b'/ShadingType 7' in pdf_bytes
+
+    # The SVG surface emits a well-formed document with the rendered
+    # mesh embedded as an image.
+    svg_file = io.BytesIO()
+    svg_surface = SVGSurface(svg_file, 100, 100)
+    context = Context(svg_surface)
+    context.set_source(pattern)
+    context.paint()
+    svg_surface.finish()
+    svg_bytes = svg_file.getvalue()
+    assert svg_bytes.startswith(b'<?xml')
+    assert b'<image' in svg_bytes
 
 
 def test_context_as_context_manager():

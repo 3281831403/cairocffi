@@ -363,9 +363,240 @@ class RadialGradient(Gradient):
         return tuple(circles)
 
 
+class MeshPattern(Pattern):
+    """Create a new mesh pattern.
+
+    Mesh patterns are patch-based gradients. A patch is a triangle
+    or a quadrilateral whose corners each carry a color; the area of
+    the patch is filled with a bilinear interpolation between those
+    colors. The shape of a patch is defined with a path
+    (see :meth:`move_to`, :meth:`line_to` and :meth:`curve_to`),
+    and its corners can be bent with control points
+    (see :meth:`set_control_point`).
+
+    A pattern is built one patch at a time:
+
+    * :meth:`begin_patch` starts a new patch,
+    * a path of three (triangle) or four (quadrilateral) sides defines
+      its shape,
+    * :meth:`set_corner_color_rgb` or :meth:`set_corner_color_rgba`
+      give a color to each corner,
+    * :meth:`end_patch` closes the patch and makes it part of the
+      pattern.
+
+    Anything done outside a patch (for example a :meth:`line_to`
+    without a :meth:`begin_patch`, an :meth:`end_patch` without a
+    matching :meth:`begin_patch`, or a fifth side on a patch) puts the
+    pattern in an error state and raises a
+    :class:`~cairocffi.CairoError` carrying the cairo status
+    (typically :obj:`STATUS_INVALID_MESH_CONSTRUCTION`).
+
+    A mesh pattern requires cairo 1.12 or newer.
+
+    """
+    def __init__(self):
+        Pattern.__init__(self, cairo.cairo_pattern_create_mesh())
+
+    def begin_patch(self):
+        """Begin a new patch.
+
+        After this call, the patch is empty and the other patch
+        construction methods (:meth:`move_to`, :meth:`line_to`,
+        :meth:`curve_to`, :meth:`set_control_point`,
+        :meth:`set_corner_color_rgb` and :meth:`set_corner_color_rgba`)
+        can be used to define the patch until :meth:`end_patch` is
+        called.
+
+        """
+        cairo.cairo_mesh_pattern_begin_patch(self._pointer)
+        self._check_status()
+
+    def end_patch(self):
+        """Indicate the end of the current patch.
+
+        The patch is defined by the path and corner colors accumulated
+        since the matching :meth:`begin_patch`. A well-formed patch has
+        three (triangle) or four (quadrilateral) sides; calling this
+        without a matching :meth:`begin_patch` puts the pattern in an
+        error state.
+
+        """
+        cairo.cairo_mesh_pattern_end_patch(self._pointer)
+        self._check_status()
+
+    def move_to(self, x, y):
+        """Define the first point of the current patch.
+
+        The patch path uses the same coordinates and semantics as
+        :meth:`Context.move_to`.
+
+        :param x: X coordinate of the new point.
+        :param y: Y coordinate of the new point.
+
+        """
+        cairo.cairo_mesh_pattern_move_to(self._pointer, x, y)
+        self._check_status()
+
+    def line_to(self, x, y):
+        """Add a straight side to the current patch,
+        from the current point to ``(x, y)``.
+
+        The new current point is ``(x, y)``.
+
+        :param x: X coordinate of the end point.
+        :param y: Y coordinate of the end point.
+
+        """
+        cairo.cairo_mesh_pattern_line_to(self._pointer, x, y)
+        self._check_status()
+
+    def curve_to(self, x1, y1, x2, y2, x3, y3):
+        """Add a cubic Bézier side to the current patch,
+        from the current point to ``(x3, y3)`` with
+        ``(x1, y1)`` and ``(x2, y2)`` as control points.
+
+        The new current point is ``(x3, y3)``.
+
+        :param x1: X coordinate of the first control point.
+        :param y1: Y coordinate of the first control point.
+        :param x2: X coordinate of the second control point.
+        :param y2: Y coordinate of the second control point.
+        :param x3: X coordinate of the end point.
+        :param y3: Y coordinate of the end point.
+
+        """
+        cairo.cairo_mesh_pattern_curve_to(
+            self._pointer, x1, y1, x2, y2, x3, y3)
+        self._check_status()
+
+    def set_control_point(self, point_num, x, y):
+        """Set a control point of the current patch.
+
+        Control points warp the patch by pulling the corresponding
+        corner toward ``(x, y)``. Valid values for ``point_num`` are
+        ``0``, ``1``, ``2`` and ``3``; a larger value puts the pattern
+        in an error state.
+
+        Control points that are not set are computed automatically
+        from the patch path.
+
+        :param point_num: The control point to set, from 0 to 3.
+        :param x: X coordinate of the control point.
+        :param y: Y coordinate of the control point.
+
+        """
+        cairo.cairo_mesh_pattern_set_control_point(
+            self._pointer, point_num, x, y)
+        self._check_status()
+
+    def set_corner_color_rgb(self, corner_num, red, green, blue):
+        """Set the color of a corner of the current patch.
+
+        :param corner_num: The corner to set, from 0 to 3.
+        :param red: Red component of the color.
+        :param green: Green component of the color.
+        :param blue: Blue component of the color.
+
+        """
+        cairo.cairo_mesh_pattern_set_corner_color_rgb(
+            self._pointer, corner_num, red, green, blue)
+        self._check_status()
+
+    def set_corner_color_rgba(
+            self, corner_num, red, green, blue, alpha=1):
+        """Set the color and alpha of a corner of the current patch.
+
+        :param corner_num: The corner to set, from 0 to 3.
+        :param red: Red component of the color.
+        :param green: Green component of the color.
+        :param blue: Blue component of the color.
+        :param alpha:
+            Alpha component of the color.
+            1 (the default) is opaque, 0 fully transparent.
+
+        """
+        cairo.cairo_mesh_pattern_set_corner_color_rgba(
+            self._pointer, corner_num, red, green, blue, alpha)
+        self._check_status()
+
+    def get_patch_count(self):
+        """Return the number of patches in this mesh pattern.
+
+        :returns: An integer count of completed patches.
+
+        """
+        count = ffi.new('unsigned int *')
+        _check_status(cairo.cairo_mesh_pattern_get_patch_count(
+            self._pointer, count))
+        return count[0]
+
+    def get_corner_color_rgba(self, patch_num, corner_num):
+        """Return the color of a corner of a patch.
+
+        Corners that were never assigned a color default to
+        transparent black ``(0, 0, 0, 0)``.
+
+        :param patch_num: The patch index, from 0 to
+            :meth:`get_patch_count` minus one.
+        :param corner_num: The corner index, from 0 to 3
+            (only 0 to 2 are meaningful for a triangular patch).
+        :returns: A ``(red, green, blue, alpha)`` tuple of floats.
+
+        """
+        rgba = ffi.new('double[4]')
+        _check_status(cairo.cairo_mesh_pattern_get_corner_color_rgba(
+            self._pointer, patch_num, corner_num,
+            rgba + 0, rgba + 1, rgba + 2, rgba + 3))
+        return tuple(rgba)
+
+    def get_control_point(self, patch_num, point_num):
+        """Return a control point of a patch.
+
+        Control points that were never set are computed from the
+        patch path and returned here.
+
+        :param patch_num: The patch index, from 0 to
+            :meth:`get_patch_count` minus one.
+        :param point_num: The control point index, from 0 to 3.
+        :returns: An ``(x, y)`` tuple of floats.
+
+        """
+        point = ffi.new('double[2]')
+        _check_status(cairo.cairo_mesh_pattern_get_control_point(
+            self._pointer, patch_num, point_num, point + 0, point + 1))
+        return tuple(point)
+
+    def get_path(self, patch_num):
+        """Return the path that defines a patch.
+
+        The returned path is in the same format as the one returned by
+        :meth:`Context.copy_path`: a list of
+        ``(path_operation, coordinates)`` tuples. It can be replayed
+        onto a context with :meth:`Context.append_path`.
+
+        Note that straight sides added with :meth:`line_to` are
+        returned as :obj:`PATH_CURVE_TO` operations, as cairo stores
+        every mesh side as a cubic Bézier curve.
+
+        :param patch_num: The patch index, from 0 to
+            :meth:`get_patch_count` minus one.
+        :returns: A list of ``(path_operation, coordinates)`` tuples.
+
+        """
+        # Imported here to avoid a circular import between
+        # cairocffi.context and cairocffi.patterns at module load time.
+        from .context import _iter_path
+        path = cairo.cairo_mesh_pattern_get_path(self._pointer, patch_num)
+        try:
+            return list(_iter_path(path))
+        finally:
+            cairo.cairo_path_destroy(path)
+
+
 PATTERN_TYPE_TO_CLASS = {
     constants.PATTERN_TYPE_SOLID: SolidPattern,
     constants.PATTERN_TYPE_SURFACE: SurfacePattern,
     constants.PATTERN_TYPE_LINEAR: LinearGradient,
     constants.PATTERN_TYPE_RADIAL: RadialGradient,
+    constants.PATTERN_TYPE_MESH: MeshPattern,
 }

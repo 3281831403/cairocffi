@@ -93,6 +93,11 @@ RadialGradient
 .. autoclass:: RadialGradient
     :members:
 
+MeshPattern
+-----------
+.. autoclass:: MeshPattern
+    :members:
+
 
 .. _fonts:
 

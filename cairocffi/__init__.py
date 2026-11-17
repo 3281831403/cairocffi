@@ -152,7 +152,7 @@ except (ImportError, OSError):
     pass
 from .patterns import (  # noqa isort:skip
     Pattern, SolidPattern, SurfacePattern, Gradient, LinearGradient,
-    RadialGradient)
+    MeshPattern, RadialGradient)
 from .fonts import (  # noqa isort:skip
     FontFace, ToyFontFace, ScaledFont, FontOptions)
 from .context import Context  # noqa isort:skip
