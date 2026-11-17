@@ -10,43 +10,119 @@
 """
 
 import ctypes
+import errno
 import io
-import operator
 import os
 import sys
 import weakref
-from functools import reduce
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 
-from . import _check_status, _keepref, cairo, constants, ffi
+from . import CairoError, _check_status, _keepref, cairo, constants, ffi
 from .fonts import FontOptions, _encode_string
 
 SURFACE_TARGET_KEY = ffi.new('cairo_user_data_key_t *')
 
 
+class _FileReader(object):
+    """Adapt a file-like object to cairo's read callback.
+
+    Short reads are resumed with further ``read()`` calls: cairo always gets
+    the number of bytes it asked for unless the stream reaches EOF or raises.
+    The data is copied straight into cairo's own buffer, one chunk at a time,
+    so the whole stream is never cached here.
+
+    Any exception raised by the underlying stream is stored and re-raised by
+    the calling code instead of being swallowed by the CFFI callback.
+
+    """
+    def __init__(self, file_obj):
+        self.error = None
+
+        @ffi.callback("cairo_read_func_t", error=constants.STATUS_READ_ERROR)
+        def read_func(_closure, data, length):
+            try:
+                offset = 0
+                while offset < length:
+                    chunk = file_obj.read(length - offset)
+                    if not chunk:  # EOF before the buffer was filled
+                        raise IOError(
+                            errno.EIO,
+                            'stream ended after %d of %d bytes'
+                            % (offset, length))
+                    if len(chunk) > length - offset:
+                        # A misbehaving stream returned more bytes than asked
+                        raise IOError(
+                            errno.EIO,
+                            'read() returned %d bytes, at most %d expected'
+                            % (len(chunk), length - offset))
+                    ffi.buffer(data, length)[offset:offset + len(chunk)] = chunk
+                    offset += len(chunk)
+            except Exception as exc:
+                self.error = exc
+                return constants.STATUS_READ_ERROR
+            return constants.STATUS_SUCCESS
+
+        self.callback = read_func
+
+
+class _FileWriter(object):
+    """Adapt a file-like object to cairo's write callback.
+
+    Each chunk is streamed straight to the file object: short writes (a
+    ``write()`` returning fewer bytes than it was given) are resumed until the
+    whole chunk is written, and the chunk is never accumulated here. A
+    ``write()`` that returns 0 or raises aborts the cairo surface; the
+    exception is stored and re-raised by the calling code (including errors
+    that only surface at :meth:`Surface.finish` time).
+
+    """
+    def __init__(self, file_obj):
+        self.error = None
+
+        @ffi.callback("cairo_write_func_t", error=constants.STATUS_WRITE_ERROR)
+        def write_func(_closure, data, length):
+            try:
+                view = memoryview(ffi.buffer(data, length))
+                offset = 0
+                while offset < length:
+                    written = file_obj.write(view[offset:])
+                    if written is None:
+                        # Buffered writers (io.BytesIO, open files, ...)
+                        # return None and always consume the whole chunk.
+                        return constants.STATUS_SUCCESS
+                    if not isinstance(written, int) or written < 0:
+                        raise OSError(
+                            errno.EIO,
+                            'write() returned an invalid value: %r'
+                            % (written,))
+                    if written == 0:
+                        raise OSError(
+                            errno.EIO,
+                            'write() wrote 0 of %d bytes' % length)
+                    offset += written
+                return constants.STATUS_SUCCESS
+            except Exception as exc:
+                self.error = exc
+                return constants.STATUS_WRITE_ERROR
+
+        self.callback = write_func
+
+
 def _make_read_func(file_obj):
-    """Return a CFFI callback that reads from a file-like object."""
-    @ffi.callback("cairo_read_func_t", error=constants.STATUS_READ_ERROR)
-    def read_func(_closure, data, length):
-        string = file_obj.read(length)
-        if len(string) < length:  # EOF too early
-            return constants.STATUS_READ_ERROR
-        ffi.buffer(data, length)[:len(string)] = string
-        return constants.STATUS_SUCCESS
-    return read_func
+    """Return a :class:`_FileReader` wrapping a file-like object."""
+    return _FileReader(file_obj)
 
 
 def _make_write_func(file_obj):
-    """Return a CFFI callback that writes to a file-like object."""
+    """Return a :class:`_FileWriter` wrapping a file-like object.
+
+    :obj:`None` means no output at all and yields a NULL cairo callback.
+
+    """
     if file_obj is None:
         return ffi.NULL
-
-    @ffi.callback("cairo_write_func_t", error=constants.STATUS_WRITE_ERROR)
-    def write_func(_closure, data, length):
-        file_obj.write(ffi.buffer(data, length))
-        return constants.STATUS_SUCCESS
-    return write_func
+    return _FileWriter(file_obj)
 
 
 def _encode_filename(filename):  # pragma: no cover
@@ -75,22 +151,42 @@ def _encode_filename(filename):  # pragma: no cover
 
 
 def from_buffer(obj):
-    """Return ``(pointer_address, length_in_bytes)`` for a buffer object."""
+    """Return ``(pointer_address, length_in_bytes)`` for a buffer object.
+
+    The buffer must be C-contiguous and writable: cairo writes directly into
+    it, so no copy is made and read-only or strided buffers are rejected
+    up front.
+
+    """
     if hasattr(obj, 'buffer_info'):
         # Looks like a array.array object.
         address, length = obj.buffer_info()
         return address, length * obj.itemsize
     elif hasattr(obj, '__array_interface__'):
         # Looks like a numpy.ndarray object
-        length = reduce(operator.mul, obj.shape)
-        return ctypes.addressof(ctypes.c_char.from_buffer(obj)), length
+        if not obj.flags.c_contiguous:
+            raise ValueError(
+                'Buffer must be C-contiguous, got a non-contiguous array.')
+        if not obj.flags.writeable:
+            raise ValueError(
+                'Buffer must be writable, got a read-only array.')
+        # nbytes is the size in bytes: counting elements would under-report
+        # the size of arrays with an itemsize larger than 1.
+        return (
+            ctypes.addressof(ctypes.c_char.from_buffer(obj)), obj.nbytes)
     else:
-        # Other buffers.
-        # XXX Unfortunately ctypes.c_char.from_buffer
-        # does not have length information,
-        # and we’re not sure that len(obj) is measured in bytes.
-        # (It’s not for array.array, though that is taken care of.)
-        return ctypes.addressof(ctypes.c_char.from_buffer(obj)), len(obj)
+        # Other buffers: expose them through the buffer protocol and check
+        # contiguity and writability from the memoryview metadata.
+        view = memoryview(obj)
+        if not view.c_contiguous:
+            raise ValueError(
+                'Buffer must be C-contiguous, got a non-contiguous buffer.')
+        if view.readonly:
+            raise ValueError(
+                'Buffer must be writable, got a read-only buffer.')
+        return (
+            ctypes.addressof(ctypes.c_char.from_buffer(view)),
+            view.nbytes)
 
 
 class KeepAlive(object):
@@ -155,6 +251,18 @@ class Surface(object):
     def __init__(self, pointer, target_keep_alive=None):
         self._pointer = ffi.gc(
             pointer, _keepref(cairo, cairo.cairo_surface_destroy))
+        # A _FileReader/_FileWriter backing a stream surface, if any:
+        # its ``error`` attribute holds the first exception raised by the
+        # underlying file object inside a CFFI callback.
+        self._stream = (
+            target_keep_alive
+            if isinstance(target_keep_alive, (_FileReader, _FileWriter))
+            else None)
+        # cairo keeps a SUCCESS status right after cairo_surface_finish():
+        # the FINISHED status only appears on the next operation, while the
+        # image buffer has already been freed. Track the transition ourselves
+        # so get_data() can refuse to expose stale pixels.
+        self._finished = False
         self._check_status()
         if hasattr(target_keep_alive, '__array_interface__'):
             is_empty = target_keep_alive.size == 0
@@ -166,7 +274,22 @@ class Surface(object):
                 self._pointer, SURFACE_TARGET_KEY, *keep_alive.closure))
             keep_alive.save()
 
+    def _raise_stream_error(self):
+        """Re-raise the exception saved by a stream callback, if any.
+
+        Exceptions raised inside CFFI callbacks cannot propagate through the
+        C call stack, so the reader/writer objects store the first one and
+        cairo only sees an error status. Re-raising the original exception
+        preserves its type, message and :attr:`OSError.errno`.
+
+        """
+        if self._stream is not None and self._stream.error is not None:
+            error = self._stream.error
+            self._stream.error = None
+            raise error
+
     def _check_status(self):
+        self._raise_stream_error()
         _check_status(cairo.cairo_surface_status(self._pointer))
 
     @staticmethod
@@ -631,9 +754,15 @@ class Surface(object):
         if it hasn't been called already,
         before freeing the resources associated with the surface.
 
+        Stream surfaces flush their remaining output here: a failure of the
+        underlying file object (including a :meth:`write` returning 0) is
+        re-raised as the original exception, with its :attr:`OSError.errno`
+        preserved.
+
         """
         cairo.cairo_surface_finish(self._pointer)
         self._check_status()
+        self._finished = True
 
     def write_to_png(self, target=None):
         """Writes the contents of surface as a PNG image.
@@ -651,10 +780,11 @@ class Surface(object):
         if return_bytes:
             target = io.BytesIO()
         if hasattr(target, 'write'):
+            writer = _make_write_func(target)
             try:
-                write_func = _make_write_func(target)
                 _check_status(cairo.cairo_surface_write_to_png_stream(
-                    self._pointer, write_func, ffi.NULL))
+                    self._pointer, writer.callback, ffi.NULL))
+                self._raise_stream_error()
             except (SystemError, MemoryError):  # pragma: no cover
                 # Callback creation has failed
                 if hasattr(target, 'name'):
@@ -670,6 +800,14 @@ class Surface(object):
                     png_file = Path(filename)
                     target.write(png_file.read_bytes())
                     png_file.unlink()
+            finally:
+                # The PNG stream is not attached to the surface, so re-raise
+                # any exception the sink raised inside the callback even when
+                # cairo itself reported success.
+                if writer.error is not None:
+                    error = writer.error
+                    writer.error = None
+                    raise error
         else:
             _check_status(cairo.cairo_surface_write_to_png(
                 self._pointer, _encode_filename(target)))
@@ -775,14 +913,17 @@ class ImageSurface(Surface):
 
         """
         if hasattr(source, 'read'):
-            read_func = _make_read_func(source)
+            reader = _make_read_func(source)
             pointer = cairo.cairo_image_surface_create_from_png_stream(
-                read_func, ffi.NULL)
+                reader.callback, ffi.NULL)
+            self = object.__new__(cls)
+            Surface.__init__(  # Skip ImageSurface.__init__
+                self, pointer, target_keep_alive=reader)
         else:
             pointer = cairo.cairo_image_surface_create_from_png(
                 _encode_filename(source))
-        self = object.__new__(cls)
-        Surface.__init__(self, pointer)  # Skip ImageSurface.__init__
+            self = object.__new__(cls)
+            Surface.__init__(self, pointer)  # Skip ImageSurface.__init__
         return self
 
     def get_data(self):
@@ -797,6 +938,12 @@ class ImageSurface(Surface):
         :returns: A read-write CFFI buffer object.
 
         """
+        if self._finished or cairo.cairo_surface_status(self._pointer) == \
+                constants.STATUS_SURFACE_FINISHED:
+            raise CairoError(
+                'Cannot get pixel data from a finished surface: '
+                'cairo has freed the underlying image buffer.',
+                constants.STATUS_SURFACE_FINISHED)
         return ffi.buffer(
             cairo.cairo_image_surface_get_data(self._pointer),
             self.get_stride() * self.get_height())
@@ -863,8 +1010,12 @@ class PDFSurface(Surface):
     def __init__(self, target, width_in_points, height_in_points):
         if hasattr(target, 'write') or target is None:
             write_func = _make_write_func(target)
+            callback = (
+                write_func if write_func == ffi.NULL
+                else write_func.callback)
             pointer = cairo.cairo_pdf_surface_create_for_stream(
-                write_func, ffi.NULL, width_in_points, height_in_points)
+                callback, ffi.NULL, width_in_points,
+                height_in_points)
         else:
             write_func = None
             pointer = cairo.cairo_pdf_surface_create(
@@ -1060,8 +1211,12 @@ class PSSurface(Surface):
     def __init__(self, target, width_in_points, height_in_points):
         if hasattr(target, 'write') or target is None:
             write_func = _make_write_func(target)
+            callback = (
+                write_func if write_func == ffi.NULL
+                else write_func.callback)
             pointer = cairo.cairo_ps_surface_create_for_stream(
-                write_func, ffi.NULL, width_in_points, height_in_points)
+                callback, ffi.NULL, width_in_points,
+                height_in_points)
         else:
             write_func = None
             pointer = cairo.cairo_ps_surface_create(
@@ -1305,8 +1460,12 @@ class SVGSurface(Surface):
     def __init__(self, target, width_in_points, height_in_points):
         if hasattr(target, 'write') or target is None:
             write_func = _make_write_func(target)
+            callback = (
+                write_func if write_func == ffi.NULL
+                else write_func.callback)
             pointer = cairo.cairo_svg_surface_create_for_stream(
-                write_func, ffi.NULL, width_in_points, height_in_points)
+                callback, ffi.NULL, width_in_points,
+                height_in_points)
         else:
             write_func = None
             pointer = cairo.cairo_svg_surface_create(

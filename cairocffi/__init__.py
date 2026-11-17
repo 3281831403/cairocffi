@@ -9,6 +9,7 @@
 
 """
 
+import errno
 import os
 import sys
 from contextlib import suppress
@@ -94,23 +95,33 @@ class CairoError(Exception):
 
 Error = CairoError  # pycairo compat
 
-STATUS_TO_EXCEPTION = {
-    constants.STATUS_NO_MEMORY: MemoryError,
-    constants.STATUS_READ_ERROR: IOError,
-    constants.STATUS_WRITE_ERROR: IOError,
-    constants.STATUS_TEMP_FILE_ERROR: IOError,
-    constants.STATUS_FILE_NOT_FOUND: FileNotFoundError,
+# cairo statuses that map onto the standard OSError family, with the errno
+# value that best describes the underlying failure.
+STATUS_TO_ERRNO = {
+    constants.STATUS_READ_ERROR: errno.EIO,
+    constants.STATUS_WRITE_ERROR: errno.EIO,
+    constants.STATUS_TEMP_FILE_ERROR: errno.EIO,
+    constants.STATUS_FILE_NOT_FOUND: errno.ENOENT,
 }
 
 
 def _check_status(status):
     """Take a cairo status code and raise an exception if/as appropriate."""
     if status != constants.STATUS_SUCCESS:
-        exception = STATUS_TO_EXCEPTION.get(status, CairoError)
         status_name = ffi.string(ffi.cast("cairo_status_t", status))
-        message = 'cairo returned %s: %s' % (
-            status_name, ffi.string(cairo.cairo_status_to_string(status)))
-        raise exception(message, status)
+        cairo_message = ffi.string(cairo.cairo_status_to_string(status))
+        message = 'cairo returned %s: %s' % (status_name, cairo_message)
+        if status == constants.STATUS_FILE_NOT_FOUND:
+            raise FileNotFoundError(
+                errno.ENOENT, message)
+        if status == constants.STATUS_NO_MEMORY:
+            raise MemoryError(message)
+        if status in STATUS_TO_ERRNO:
+            # Build a proper OSError so that errno holds an integer (and
+            # strerror is the message), instead of stuffing the message into
+            # the errno slot.
+            raise OSError(STATUS_TO_ERRNO[status], message)
+        raise CairoError(message, status)
 
 
 def cairo_version():

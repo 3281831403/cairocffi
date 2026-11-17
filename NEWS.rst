@@ -2,6 +2,26 @@ cairocffi changelog
 -------------------
 
 
+Version 1.7.2
+.............
+
+Not released yet
+
+* Fix stream surface IO so that short reads are resumed and short writes
+  are retried instead of silently truncating PNG/PDF/PS/SVG output
+* Exceptions raised by the underlying file object (including a ``write()``
+  returning 0) now reach the caller, even when they only occur at
+  ``finish()`` time, with the original ``OSError.errno`` preserved
+* Wrap any C-contiguous writable buffer into an ``ImageSurface`` without
+  copying; numpy buffer sizes are computed from ``nbytes`` rather than the
+  number of elements, and read-only or non-contiguous buffers are rejected
+* ``ImageSurface.get_data()`` raises after ``finish()`` instead of exposing
+  freed pixel memory
+* Cairo IO statuses now raise well-formed ``OSError`` exceptions with an
+  integer ``errno`` instead of storing the error message in the ``errno``
+  slot
+
+
 Version 1.7.1
 .............
 

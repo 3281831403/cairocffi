@@ -12,6 +12,7 @@
 import array
 import base64
 import contextlib
+import errno
 import gc
 import io
 import math
@@ -1279,3 +1280,191 @@ def test_hairline():
         assert(ctx.get_hairline() is True)
         ctx.set_hairline(False)
         assert(ctx.get_hairline() is False)
+
+
+class ChunkedReader:
+    """A file-like object whose read() never returns more than chunk bytes,
+    exercising the short-read resume loop."""
+    def __init__(self, data, chunk):
+        self.data = data
+        self.chunk = chunk
+        self.pos = 0
+
+    def read(self, length):
+        chunk = self.data[self.pos:self.pos + min(length, self.chunk)]
+        self.pos += len(chunk)
+        return chunk
+
+
+class PartialWriter:
+    """A sink whose write() only accepts at most chunk bytes per call."""
+    def __init__(self, chunk):
+        self.chunk = chunk
+        self.parts = []
+
+    def write(self, data):
+        take = min(self.chunk, len(data))
+        self.parts.append(bytes(data[:take]))
+        return take
+
+    def getvalue(self):
+        return b''.join(self.parts)
+
+
+def test_png_stream_short_reads():
+    surface = ImageSurface(cairocffi.FORMAT_ARGB32, 4, 4)
+    png_bytes = surface.write_to_png()
+    reference = ImageSurface.create_from_png(io.BytesIO(png_bytes))
+    for chunk in range(1, 9):
+        decoded = ImageSurface.create_from_png(
+            ChunkedReader(png_bytes, chunk))
+        assert decoded.get_width() == 4
+        assert decoded.get_height() == 4
+        assert decoded.get_data()[:] == reference.get_data()[:]
+
+
+def test_png_stream_short_writes():
+    png_bytes = ImageSurface(
+        cairocffi.FORMAT_ARGB32, 4, 4).write_to_png()
+    for chunk in (1, 2, 3, 5, 7):
+        sink = PartialWriter(chunk)
+        ImageSurface(cairocffi.FORMAT_ARGB32, 4, 4).write_to_png(sink)
+        assert sink.getvalue() == png_bytes
+    # The reassembled stream is still a valid PNG
+    decoded = ImageSurface.create_from_png(
+        io.BytesIO(_png_through_partial_writer(3)))
+    assert decoded.get_width() == 4
+
+
+def _png_through_partial_writer(chunk):
+    sink = PartialWriter(chunk)
+    ImageSurface(cairocffi.FORMAT_ARGB32, 4, 4).write_to_png(sink)
+    return sink.getvalue()
+
+
+class ZeroWriter:
+    def write(self, data):
+        return 0
+
+
+def test_png_stream_zero_write_raises():
+    with pytest.raises(OSError) as exc:
+        ImageSurface(
+            cairocffi.FORMAT_ARGB32, 4, 4).write_to_png(ZeroWriter())
+    assert isinstance(exc.value.errno, int)
+
+
+class FailingWriter:
+    def __init__(self, exception):
+        self.exception = exception
+
+    def write(self, data):
+        raise self.exception
+
+
+@pytest.mark.parametrize('surface_class', [PDFSurface, PSSurface, SVGSurface])
+def test_stream_surface_short_writes(surface_class):
+    sink = PartialWriter(2)
+    surface = surface_class(sink, 10, 10)
+    Context(surface).paint()
+    surface.finish()
+    output = sink.getvalue()
+    if surface_class is PDFSurface:
+        assert output.startswith(b'%PDF')
+    elif surface_class is PSSurface:
+        assert output.startswith(b'%!PS')
+    else:
+        assert output.startswith(b'<?xml')
+
+
+@pytest.mark.parametrize('surface_class', [PDFSurface, PSSurface, SVGSurface])
+def test_stream_surface_sink_error_at_finish(surface_class):
+    error = OSError(errno.ENOSPC, 'no space left on device')
+    surface = surface_class(FailingWriter(error), 10, 10)
+    Context(surface).paint()
+    with pytest.raises(OSError) as exc:
+        surface.finish()
+    # The original exception, with its errno, reaches the caller
+    assert exc.value.errno == errno.ENOSPC
+    assert exc.value.strerror == 'no space left on device'
+
+
+@pytest.mark.parametrize('surface_class', [PDFSurface, PSSurface, SVGSurface])
+def test_stream_surface_zero_write_at_finish(surface_class):
+    surface = surface_class(ZeroWriter(), 10, 10)
+    Context(surface).paint()
+    with pytest.raises(OSError):
+        surface.finish()
+
+
+def test_png_sink_exception_preserved():
+    error = OSError(errno.EACCES, 'permission denied')
+    with pytest.raises(OSError) as exc:
+        ImageSurface(cairocffi.FORMAT_ARGB32, 4, 4).write_to_png(
+            FailingWriter(error))
+    assert exc.value.errno == errno.EACCES
+    assert exc.value.strerror == 'permission denied'
+
+
+def test_create_from_png_reader_exception_preserved():
+    class FailingReader:
+        def read(self, length):
+            raise OSError(errno.EBADF, 'bad file descriptor')
+
+    with pytest.raises(OSError) as exc:
+        ImageSurface.create_from_png(FailingReader())
+    assert exc.value.errno == errno.EBADF
+
+
+def test_io_errors_have_integer_errno():
+    # The long cairo status message must not be stored in the errno slot
+    with pytest.raises(OSError) as exc:
+        ImageSurface.create_from_png(io.BytesIO(b''))
+    assert isinstance(exc.value.errno, int)
+    assert isinstance(exc.value.strerror, str)
+
+    png_bytes = ImageSurface(
+        cairocffi.FORMAT_ARGB32, 4, 4).write_to_png()
+    with pytest.raises(IOError) as exc:
+        # A truncated PNG stream reaches EOF mid-decode
+        ImageSurface.create_from_png(io.BytesIO(png_bytes[:30]))
+    assert isinstance(exc.value.errno, int)
+
+
+def test_file_not_found_error_errno():
+    with temp_directory() as tempdir:
+        filename = os.path.join(tempdir, 'missing.png')
+        with pytest.raises(FileNotFoundError) as exc:
+            ImageSurface.create_from_png(filename)
+        assert exc.value.errno == errno.ENOENT
+
+
+def test_get_data_after_finish():
+    surface = ImageSurface(cairocffi.FORMAT_ARGB32, 4, 4)
+    Context(surface).paint()
+    surface.finish()
+    with pytest.raises(cairocffi.CairoError) as exc:
+        surface.get_data()
+    assert exc.value.status == cairocffi.STATUS_SURFACE_FINISHED
+
+
+def test_image_buffer_rejects_non_contiguous_and_readonly():
+    # Generic writable buffer still works
+    data = bytearray(64)
+    surface = ImageSurface(
+        cairocffi.FORMAT_ARGB32, 4, 4, data=data)
+    Context(surface).paint()
+    assert any(data)
+
+    # Read-only bytes are rejected
+    with pytest.raises(ValueError):
+        ImageSurface(
+            cairocffi.FORMAT_ARGB32, 4, 4, data=b'\x00' * 64)
+
+    # Non-contiguous memoryviews are rejected
+    strided = memoryview(bytearray(128))[::2]
+    assert not strided.contiguous
+    with pytest.raises(ValueError):
+        ImageSurface(
+            cairocffi.FORMAT_ARGB32, 4, 4, data=strided)
+
